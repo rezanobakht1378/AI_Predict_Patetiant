@@ -2,3 +2,4 @@ pandas
 numpy
 scikit-learn
 xgboost
+git+https://github.com/jbaldivieso/pygrowup2.git
