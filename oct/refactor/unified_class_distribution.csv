@@ -1,0 +1,20 @@
+Age_Milestone_Metric,Normal,Severe weight loss,Weight loss,Severe underweight,Underweight,Severe short stature,Short stature,Missing_Records,Total_Cohort
+Birth (Weight),453,0,0,27,24,0,0,0,504
+Birth (Height),456,0,0,0,0,22,26,0,504
+Birth (BMI),366,56,82,0,0,0,0,0,504
+6 Months (Weight),376,0,0,13,41,0,0,74,504
+6 Months (Height),387,0,0,0,0,14,27,76,504
+6 Months (BMI),368,11,49,0,0,0,0,76,504
+12 Months (Weight),378,0,0,9,55,0,0,62,504
+12 Months (Height),407,0,0,0,0,13,22,62,504
+12 Months (BMI),380,12,50,0,0,0,0,62,504
+18 Months (Weight),353,0,0,8,66,0,0,77,504
+18 Months (Height),378,0,0,0,0,12,35,79,504
+18 Months (BMI),366,14,46,0,0,0,0,78,504
+24 Months (Weight),210,0,0,59,71,0,0,164,504
+24 Months (Height),321,0,0,0,0,3,19,161,504
+24 Months (BMI),225,60,58,0,0,0,0,161,504
+36 Months (Weight),135,0,0,34,43,0,0,292,504
+36 Months (Height),169,0,0,0,0,6,16,313,504
+36 Months (BMI),109,39,44,0,0,0,0,312,504
+48 Months (Height),91,0,0,0,0,1,15,397,504
