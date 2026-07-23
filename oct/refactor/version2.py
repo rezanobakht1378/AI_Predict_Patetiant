@@ -6,6 +6,7 @@ from sklearn.svm import SVC
 from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.neighbors import KNeighborsClassifier
 from sklearn.model_selection import train_test_split
 from imblearn.over_sampling import SMOTE, SMOTENC, RandomOverSampler
 from sklearn.preprocessing import StandardScaler, OneHotEncoder, label_binarize
@@ -98,7 +99,7 @@ weight_zscore_cols = [
     "wt_12m_zscore",
     "wt_18m_zscore",
     "wt_24m_zscore",
-    "wt_36m_zscore_Imputation",
+    "wt_36m_zscore",
     "wt_48m_zscore",
 ]
 
@@ -118,7 +119,7 @@ zscore_cols = [
     'BMI_12m_zscore', 'ht_1y_zscore', 'wt_12m_zscore',
     'BMI_18m_zscore', 'ht_18m_zscore', 'wt_18m_zscore',
     'BMI_24m_zscore', 'ht_24m_zscore', 'wt_24m_zscore',
-    'BMI_36m_zscore', 'ht_36m_zscore', 'wt_36m_zscore_Imputation',
+    'BMI_36m_zscore', 'ht_36m_zscore', 'wt_36m_zscore',
     'BMI_48m_zscore', 'ht_48m_zscore', 'wt_48m_zscore'
 ]
 
@@ -164,7 +165,7 @@ all_milestones = {
     '24 Months (Weight)': ('wt_24m_zscore', assign_weight_class),
     '24 Months (Height)': ('ht_24m_zscore', assign_height_class),
     '24 Months (BMI)':    ('BMI_24m_zscore', assign_bmi_class),
-    '36 Months (Weight)': ('wt_36m_zscore_Imputation', assign_weight_class),
+    '36 Months (Weight)': ('wt_36m_zscore', assign_weight_class),
     '36 Months (Height)': ('ht_36m_zscore', assign_height_class),
     '36 Months (BMI)':    ('BMI_36m_zscore', assign_bmi_class),
     '48 Months (Weight)': ('wt_48m_zscore', assign_weight_class),
@@ -297,7 +298,8 @@ models = {
     'XGBoost_Classifier': XGBClassifier(n_estimators=100, max_depth=5, learning_rate=0.05, eval_metric='mlogloss', random_state=42),
     'Support_Vector_Classifier': SVC(kernel='rbf', C=10.0, probability=True, decision_function_shape='ovr', random_state=42, class_weight='balanced'),
     'Neural_Network_MLP': MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=500, random_state=42),
-    'RandomForestClassifier': RandomForestClassifier(n_estimators=400, random_state=42, n_jobs=-1, class_weight='balanced')
+    'RandomForestClassifier': RandomForestClassifier(n_estimators=400, random_state=42, n_jobs=-1, class_weight='balanced'),
+    'KNN': KNeighborsClassifier(n_neighbors=5)
 }
 
 # =====================================================================
@@ -875,6 +877,38 @@ for transition in age_transitions:
                 aic_features = [f for f in aic_features if f != "const"]
                 bic_features = [f for f in bic_features if f != "const"]
 
+                plot_features = aic_features if len(aic_features) > 1 else bic_features
+
+                if len(plot_features) >= 2:
+
+                    corr = X_train_fs[plot_features].corr()
+
+                    plt.figure(figsize=(12,10))
+
+                    sns.heatmap(
+                        corr,
+                        cmap="coolwarm",
+                        center=0,
+                        square=True,
+                        annot=False,
+                        linewidths=.5
+                    )
+
+                    plt.title(
+                        f"{safe_name}\n{len(plot_features)} Selected Features"
+                    )
+
+                    plt.tight_layout()
+
+                    plt.savefig(
+                        os.path.join(
+                            "correlation_plots",
+                            f"{safe_name}.png"
+                        ),
+                        dpi=300
+                    )
+
+                    plt.close()
                 # ============================================================
                 # SAVE OPTIMIZED FEATURE SPACES
                 # ============================================================
