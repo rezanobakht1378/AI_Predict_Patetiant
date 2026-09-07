@@ -28,6 +28,8 @@ from sklearn.metrics import (
 from sklearn.preprocessing import label_binarize
 from sklearn.metrics import roc_curve
 import os
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -65,6 +67,9 @@ age_mapping = {
 for age, (weight_col, height_col) in age_mapping.items():
 
     if weight_col in df.columns and height_col in df.columns:
+
+        df[weight_col] = pd.to_numeric(df[weight_col], errors='coerce')
+        df[height_col] = pd.to_numeric(df[height_col], errors='coerce')
 
         bmi_col = f"BMI_{age}"
 
@@ -135,8 +140,10 @@ headcirc_cols = [
 ]
 
 # =====================================================================
-# 1. CLINICAL CLASSIFICATION LOGIC (UNIFIED 'Normal' LABEL)
+# 1. STRATEGY 1: CATEGORICAL GROWTH-STATUS CLASSIFICATION
 # =====================================================================
+# راهبرد اول وضعیت رشد دسته‌ای را پیش‌بینی می‌کند و منطق موجود آن عمداً حفظ شده است.
+# این راهبرد با راهبرد دوم که بر پایه‌ی دلتا Z-score است، یکسان نیست.
 def assign_weight_class(zscore):
     if pd.isna(zscore): return np.nan
     return 'Severe underweight' if float(zscore) <= -3 else 'Underweight' if float(zscore) <= -2 and float(zscore) > -3 else 'Normal'
@@ -365,6 +372,7 @@ history_map = {
 
 metrics = ['Weight', 'Height', 'BMI']
 results_master = []
+label_accuracy_results = []
 
 for transition in age_transitions:
     current_age = transition['current_age']
@@ -379,7 +387,9 @@ for transition in age_transitions:
         valid_mask = y_vector.dropna().index
         
         df_valid = df.loc[valid_mask]
-        y_valid = y_vector.loc[valid_mask].astype('category').cat.codes
+        y_valid_labels = y_vector.loc[valid_mask].astype('category')
+        label_names = list(y_valid_labels.cat.categories)
+        y_valid = y_valid_labels.cat.codes
         
         for sc_name, feature_space in scenarios.items():
             # current_features = [
@@ -409,6 +419,8 @@ for transition in age_transitions:
                 X_space, y_valid, test_size=0.2, random_state=42, 
                 stratify=y_valid if can_stratify else None
             )
+
+            original_train_label_counts = y_train.value_counts().to_dict()
 
             imputer = SimpleImputer(strategy="median")
 
@@ -482,12 +494,35 @@ for transition in age_transitions:
                     except Exception:
                         probs = None
 
-                cm = confusion_matrix(y_test, predictions)
+                class_codes = np.arange(len(label_names))
+                cm = confusion_matrix(y_test, predictions, labels=class_codes)
                 cm_df = pd.DataFrame(cm)
                 cm_df.to_csv(
                     f"confusion_matrices/confusion_{current_age}_{target_key}_{model_name}.csv",
                     index=False
                 )
+
+                for class_code, label_name in enumerate(label_names):
+                    label_test_count = int((y_test == class_code).sum())
+                    correct_predictions = int(
+                        ((y_test == class_code) & (predictions == class_code)).sum()
+                    )
+                    label_accuracy_results.append({
+                        "Predictor_Age": current_age,
+                        "Predicted_Target": target_key,
+                        "Scenario": sc_name,
+                        "Model": model_name,
+                        "Label": label_name,
+                        "Total_Label_Count": int((y_valid == class_code).sum()),
+                        "Train_Label_Count": int(original_train_label_counts.get(class_code, 0)),
+                        "Oversampled_Train_Label_Count": int((y_train == class_code).sum()),
+                        "Test_Label_Count": label_test_count,
+                        "Correct_Predictions": correct_predictions,
+                        "Label_Accuracy": round(
+                            correct_predictions / label_test_count,
+                            4
+                        ) if label_test_count else np.nan,
+                    })
 
                 auc = get_roc_auc_score(pipeline, X_test, y_test)
                 acc = accuracy_score(y_test, predictions)
@@ -587,6 +622,10 @@ for transition in age_transitions:
 
 df_performance = pd.DataFrame(results_master)
 df_performance.to_csv('chronological_predictive_performance.csv', index=False)
+pd.DataFrame(label_accuracy_results).to_csv(
+    'chronological_label_accuracy.csv',
+    index=False
+)
 
 os.makedirs("roc_plots", exist_ok=True)
 os.makedirs("roc_data", exist_ok=True)
@@ -1078,3 +1117,346 @@ if final_results_report:
     print("\n[Data Export] CSV metric tables generated: 'feature_reduction_performance.csv'")
 else:
     print("\n[Execution Warning] No classifiers could be trained. Check target distributions.")
+
+# =====================================================================
+# STRATEGY 2: GROWTH-CHANNEL CHANGE FROM DELTA Z-SCORES
+# =====================================================================
+# This section is intentionally independent of Strategy 1. It predicts the
+# numerical next-transition delta and derives channel-change labels only for
+# secondary evaluation; categorical nutritional labels are never targets here.
+# این بخش مستقل از راهبرد اول است و فقط تغییر عددی Z-score را پیش‌بینی می‌کند.
+# برچسب تغییر کانال تنها از شرط قدرمطلق دلتا بزرگ‌تر یا مساوی ۰٫۶۷ ساخته می‌شود.
+from sklearn.base import clone
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
+    median_absolute_error,
+    explained_variance_score,
+    precision_score as binary_precision_score,
+    recall_score as binary_recall_score,
+)
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.neural_network import MLPRegressor
+from sklearn.svm import SVR
+
+Z_SCORE_CHANGE_THRESHOLD = 0.67
+STRATEGY_2_RANDOM_STATE = 42
+STRATEGY_2_OUTPUT_DIR = os.path.join("results", "strategy_2")
+
+
+def _first_available_column(frame, candidates):
+    """Return the first dataset column present in candidates."""
+    return next((column for column in candidates if column in frame.columns), None)
+
+
+def _strategy_2_zscore_columns(frame):
+    """Map each recorded age to its available height, weight and BMI Z-score."""
+    aliases = {
+        "Height": {
+            "Birth": ["ht_birth_zscore"], "6 Months": ["ht_6m_zscore"],
+            "12 Months": ["ht_1y_zscore", "ht_12m_zscore_Imputation"],
+            "18 Months": ["ht_18m_zscore"], "24 Months": ["ht_24m_zscore"],
+            "36 Months": ["ht_36m_zscore", "ht_36m_zscore_Imputation"],
+            "48 Months": ["ht_48m_zscore", "ht_48m_zscore_Imputation"]},
+        "Weight": {
+            "Birth": ["wt_birth_zscore"], "6 Months": ["wt_6m_zscore"],
+            "12 Months": ["wt_12m_zscore"], "18 Months": ["wt_18m_zscore"],
+            "24 Months": ["wt_24m_zscore"],
+            "36 Months": ["wt_36m_zscore", "wt_3y_zscore", "wt_36m_zscore_Imputation"],
+            "48 Months": ["wt_48m_zscore", "wt_4y_zscore", "wt_48m_zscore_Imputation"]},
+        "BMI": {
+            "Birth": ["BMI_birth_zscore"], "6 Months": ["BMI_6m_zscore"],
+            "12 Months": ["BMI_12m_zscore"], "18 Months": ["BMI_18m_zscore"],
+            "24 Months": ["BMI_24m_zscore"], "36 Months": ["BMI_36m_zscore"],
+            "48 Months": ["BMI_48m_zscore", "BMI_4y_zscore", "BMI_48m_zscore_Imputation"]}}
+    return {
+        metric: {age: _first_available_column(frame, candidates)
+                 for age, candidates in age_map.items()}
+        for metric, age_map in aliases.items()
+    }
+
+
+def _strategy_2_create_deltas(frame, zscore_map):
+    """Create only observed, explicit transition deltas for each child."""
+    # دلتا فقط بین دو اندازه‌گیری متوالی موجود محاسبه می‌شود؛ داده‌ی آینده پر نمی‌شود.
+    result = frame.copy()
+    delta_columns = {metric: {} for metric in zscore_map}
+    for transition in age_transitions:
+        current_age = transition["current_age"]
+        next_age = transition["next_age"]
+        for metric, age_columns in zscore_map.items():
+            current_column = age_columns.get(current_age)
+            next_column = age_columns.get(next_age)
+            delta_column = f"delta_z_{metric.lower()}_{next_age.replace(' ', '_').lower()}"
+            if current_column and next_column:
+                result[delta_column] = (
+                    pd.to_numeric(result[next_column], errors="coerce")
+                    - pd.to_numeric(result[current_column], errors="coerce")
+                )
+            else:
+                result[delta_column] = np.nan
+            delta_columns[metric][next_age] = delta_column
+    return result, delta_columns
+
+
+def _strategy_2_feature_candidates(current_age, frame, zscore_map, delta_columns):
+    """Return predictors known by current_age, excluding future measurements."""
+    allowed_ages = history_map[current_age]
+    age_tokens = tuple(age.lower() for age in allowed_ages)
+    current_transition_index = next(
+        (index for index, item in enumerate(age_transitions)
+         if item["current_age"] == current_age), len(age_transitions))
+    available_delta_ages = {
+        item["next_age"] for item in age_transitions[:current_transition_index]
+    }
+    candidates = [column for column in base_cols if column in frame.columns]
+    for column in list(raw_metrics) + list(zscore_cols):
+        if column in frame.columns and any(token in column.lower() for token in age_tokens):
+            candidates.append(column)
+    for metric_deltas in delta_columns.values():
+        for transition_age, column in metric_deltas.items():
+            if transition_age in available_delta_ages and column in frame.columns:
+                candidates.append(column)
+    return list(dict.fromkeys(candidates))
+
+
+def _strategy_2_prepare_features(frame, columns):
+    """Impute and encode predictors using a train-fitted transformation."""
+    numeric_columns = [c for c in columns if c not in ["gender", "delivery_type"]]
+    categorical_columns = [c for c in columns if c in ["gender", "delivery_type"]]
+    transformers = []
+    if numeric_columns:
+        transformers.append(("numeric", Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler())]), numeric_columns))
+    if categorical_columns:
+        transformers.append(("categorical", Pipeline([
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False))]), categorical_columns))
+    return ColumnTransformer(transformers=transformers, remainder="drop")
+
+
+def _strategy_2_forward_selection(X_train, y_train, criterion):
+    """Greedy OLS selection on training data, using AIC or BIC only."""
+    # انتخاب ویژگی با رگرسیون آماری OLS و فقط روی بخش آموزش انجام می‌شود.
+    if X_train.shape[1] == 0:
+        return [], np.nan
+    remaining = list(X_train.columns)
+    selected = []
+
+    def score(features):
+        design = sm.add_constant(X_train[features], has_constant="add")
+        fitted = sm.OLS(y_train, design).fit()
+        return fitted.aic if criterion == "AIC" else fitted.bic
+
+    try:
+        best_score = score([])
+    except Exception:
+        return [], np.nan
+    while remaining:
+        trial_scores = []
+        for candidate in remaining:
+            try:
+                trial_scores.append((score(selected + [candidate]), candidate))
+            except Exception:
+                continue
+        if not trial_scores:
+            break
+        candidate_score, candidate = min(trial_scores, key=lambda item: item[0])
+        if candidate_score < best_score - 1e-9:
+            selected.append(candidate)
+            remaining.remove(candidate)
+            best_score = candidate_score
+        else:
+            break
+    return selected, best_score
+
+
+def _strategy_2_regression_metrics(y_true, predictions):
+    errors = np.asarray(y_true) - np.asarray(predictions)
+    nonzero = np.abs(y_true) > 1e-8
+    mape = np.mean(np.abs(errors[nonzero] / y_true[nonzero])) * 100 if nonzero.any() else np.nan
+    return {
+        "MAE": mean_absolute_error(y_true, predictions),
+        "MSE": mean_squared_error(y_true, predictions),
+        "RMSE": np.sqrt(mean_squared_error(y_true, predictions)),
+        "R2": r2_score(y_true, predictions) if len(np.unique(y_true)) > 1 else np.nan,
+        "MAPE": mape,
+        "Median_Absolute_Error": median_absolute_error(y_true, predictions),
+        "Explained_Variance": explained_variance_score(y_true, predictions),
+    }
+
+
+def _strategy_2_channel_metrics(y_true, predictions):
+    # هدف پیوسته به‌صورت جداگانه به تشخیص دودویی تغییر کانال تبدیل می‌شود.
+    actual = (np.abs(y_true) >= Z_SCORE_CHANGE_THRESHOLD).astype(int)
+    predicted = (np.abs(predictions) >= Z_SCORE_CHANGE_THRESHOLD).astype(int)
+    matrix = confusion_matrix(actual, predicted, labels=[0, 1])
+    tn, fp, fn, tp = matrix.ravel()
+    specificity = tn / (tn + fp) if tn + fp else np.nan
+    scores = {
+        "Accuracy": accuracy_score(actual, predicted),
+        "Precision": binary_precision_score(actual, predicted, zero_division=0),
+        "Recall": binary_recall_score(actual, predicted, zero_division=0),
+        "Specificity": specificity,
+        "F1": f1_score(actual, predicted, zero_division=0),
+        "Balanced_Accuracy": balanced_accuracy_score(actual, predicted),
+        "MCC": matthews_corrcoef(actual, predicted) if len(np.unique(predicted)) > 1 else 0.0,
+        "Confusion_Matrix": np.array2string(matrix, separator=",")}
+    scores["ROC_AUC"] = (roc_auc_score(actual, np.abs(predictions))
+                          if len(np.unique(actual)) > 1 else np.nan)
+    return scores
+
+
+def _strategy_2_model_definitions():
+    return {
+        "Linear_Regression": LinearRegression(),
+        "Random_Forest_Regression": RandomForestRegressor(
+            n_estimators=300, random_state=STRATEGY_2_RANDOM_STATE, n_jobs=-1),
+        "Gradient_Boosting_Regression": GradientBoostingRegressor(random_state=STRATEGY_2_RANDOM_STATE),
+        "SVR": SVR(kernel="rbf"),
+        "MLP_Regression": MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=500,
+                                        random_state=STRATEGY_2_RANDOM_STATE),
+        "KNN_Regression": KNeighborsRegressor(n_neighbors=5),
+    }
+
+
+def run_strategy_2():
+    # این حلقه‌ها برای هر سن، شاخص رشد و روش انتخاب ویژگی یک آزمایش مستقل می‌سازند.
+    os.makedirs(STRATEGY_2_OUTPUT_DIR, exist_ok=True)
+    zscore_map = _strategy_2_zscore_columns(df)
+    strategy_df, delta_columns = _strategy_2_create_deltas(df, zscore_map)
+    regression_rows = []
+    channel_rows = []
+    selection_rows = []
+    prediction_rows = []
+
+    for transition in age_transitions:
+        current_age = transition["current_age"]
+        next_age = transition["next_age"]
+        for metric in ["Height", "Weight", "BMI"]:
+            target_column = delta_columns[metric].get(next_age)
+            feature_columns = _strategy_2_feature_candidates(
+                current_age, strategy_df, zscore_map, delta_columns)
+            if not target_column or not feature_columns:
+                continue
+            valid = strategy_df[target_column].notna()
+            valid &= strategy_df[feature_columns].notna().any(axis=1)
+            if valid.sum() < 10:
+                continue
+            X = strategy_df.loc[valid, feature_columns].copy()
+            y = pd.to_numeric(strategy_df.loc[valid, target_column], errors="coerce")
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=0.2, random_state=STRATEGY_2_RANDOM_STATE)
+            preprocessor = _strategy_2_prepare_features(X_train, feature_columns)
+            X_train_encoded = pd.DataFrame(
+                preprocessor.fit_transform(X_train), index=X_train.index)
+            X_test_encoded = pd.DataFrame(
+                preprocessor.transform(X_test), index=X_test.index,
+                columns=X_train_encoded.columns)
+            X_train_encoded.columns = [f"feature_{i}" for i in range(X_train_encoded.shape[1])]
+            X_test_encoded.columns = X_train_encoded.columns
+
+            selected_by_method = {"Full": list(X_train_encoded.columns)}
+            for criterion in ["AIC", "BIC"]:
+                selected, score = _strategy_2_forward_selection(
+                    X_train_encoded, y_train, criterion)
+                selected_by_method[criterion] = selected
+                selection_rows.append({
+                    "target_variable": target_column, "age": f"{current_age} -> {next_age}",
+                    "target": metric, "selection_method": criterion,
+                    "selected_features": ", ".join(selected),
+                    "number_of_features": len(selected),
+                    "AIC_score": score if criterion == "AIC" else np.nan,
+                    "BIC_score": score if criterion == "BIC" else np.nan})
+
+            for selection_method, selected in selected_by_method.items():
+                if not selected:
+                    continue
+                for model_name, model in _strategy_2_model_definitions().items():
+                    pipeline = Pipeline([("model", clone(model))])
+                    pipeline.fit(X_train_encoded[selected], y_train)
+                    predictions = pipeline.predict(X_test_encoded[selected])
+                    regression = _strategy_2_regression_metrics(y_test, predictions)
+                    channel = _strategy_2_channel_metrics(y_test.to_numpy(), predictions)
+                    common = {
+                        "Age": f"{current_age} -> {next_age}", "Current_Age": current_age,
+                        "Next_Age": next_age, "Target": metric,
+                        "Target_Variable": target_column, "Model": model_name,
+                        "Feature_Selection": selection_method,
+                        "Number_of_Features": len(selected),
+                        "Selected_Features": ", ".join(selected)}
+                    regression_rows.append({**common, **regression})
+                    channel_rows.append({**common, **channel})
+                    if selection_method != "Full":
+                        prediction_rows.extend({
+                            **common, "Actual_Delta_Z": actual, "Predicted_Delta_Z": predicted,
+                            "Actual_Channel_Change": int(abs(actual) >= Z_SCORE_CHANGE_THRESHOLD),
+                            "Predicted_Channel_Change": int(abs(predicted) >= Z_SCORE_CHANGE_THRESHOLD)
+                        } for actual, predicted in zip(y_test, predictions))
+
+    regression_df = pd.DataFrame(regression_rows)
+    channel_df = pd.DataFrame(channel_rows)
+    selection_df = pd.DataFrame(selection_rows)
+    predictions_df = pd.DataFrame(prediction_rows)
+    regression_df.to_csv(os.path.join(STRATEGY_2_OUTPUT_DIR, "strategy_2_regression_results.csv"), index=False)
+    channel_df.to_csv(os.path.join(STRATEGY_2_OUTPUT_DIR, "strategy_2_channel_change_results.csv"), index=False)
+    selection_df.to_csv(os.path.join(STRATEGY_2_OUTPUT_DIR, "strategy_2_feature_selection_results.csv"), index=False)
+    predictions_df.to_csv(os.path.join(STRATEGY_2_OUTPUT_DIR, "strategy_2_predictions.csv"), index=False)
+
+    if regression_df.empty:
+        return
+    best_rows = regression_df.sort_values(
+        ["Target", "Age", "RMSE", "MAE", "R2"],
+        ascending=[True, True, True, True, False]).groupby(["Target", "Age"], as_index=False).first()
+    best_rows.to_csv(os.path.join(STRATEGY_2_OUTPUT_DIR, "strategy_2_best_models.csv"), index=False)
+
+    for metric in ["Height", "Weight", "BMI"]:
+        metric_rows = regression_df[regression_df["Target"] == metric]
+        if metric_rows.empty:
+            continue
+        plt.figure(figsize=(12, 6))
+        sns.lineplot(data=metric_rows, x="Age", y="RMSE", hue="Model", style="Feature_Selection", marker="o")
+        plt.xticks(rotation=35, ha="right")
+        plt.title(f"Strategy 2 {metric} Delta Z RMSE by Age")
+        plt.tight_layout()
+        plt.savefig(os.path.join(STRATEGY_2_OUTPUT_DIR, f"{metric.lower()}_rmse_by_age.png"), dpi=300)
+        plt.close()
+
+    if not predictions_df.empty:
+        best_prediction = predictions_df.merge(
+            best_rows[["Target", "Age", "Model", "Feature_Selection"]],
+            on=["Target", "Age", "Model", "Feature_Selection"], how="inner")
+        for metric in ["Height", "Weight", "BMI"]:
+            selected = best_prediction[best_prediction["Target"] == metric]
+            if selected.empty:
+                continue
+            plt.figure(figsize=(7, 6))
+            plt.scatter(selected["Actual_Delta_Z"], selected["Predicted_Delta_Z"], alpha=0.65)
+            plt.axvline(Z_SCORE_CHANGE_THRESHOLD, color="red", linestyle="--")
+            plt.axvline(-Z_SCORE_CHANGE_THRESHOLD, color="red", linestyle="--")
+            plt.axhline(Z_SCORE_CHANGE_THRESHOLD, color="red", linestyle=":")
+            plt.axhline(-Z_SCORE_CHANGE_THRESHOLD, color="red", linestyle=":")
+            plt.xlabel("Actual Delta Z-score")
+            plt.ylabel("Predicted Delta Z-score")
+            plt.title(f"Strategy 2 {metric}: Actual vs Predicted Delta Z")
+            plt.tight_layout()
+            plt.savefig(os.path.join(STRATEGY_2_OUTPUT_DIR, f"{metric.lower()}_actual_vs_predicted.png"), dpi=300)
+            plt.close()
+
+    summary_lines = ["Strategy 2 research summary", f"Threshold: {Z_SCORE_CHANGE_THRESHOLD}"]
+    for metric in ["Height", "Weight", "BMI"]:
+        metric_best = best_rows[best_rows["Target"] == metric]
+        if not metric_best.empty:
+            overall = metric_best.sort_values(["RMSE", "MAE", "R2"], ascending=[True, True, False]).iloc[0]
+            summary_lines.append(f"Best {metric} model: {overall['Model']} ({overall['Feature_Selection']}); RMSE={overall['RMSE']:.4f}")
+    summary_lines.append("All conclusions above are generated from strategy_2_best_models.csv.")
+    with open(os.path.join(STRATEGY_2_OUTPUT_DIR, "strategy_2_summary.txt"), "w", encoding="utf-8") as summary_file:
+        summary_file.write("\n".join(summary_lines))
+    print("Strategy 2 complete. Outputs saved under results/strategy_2.")
+
+
+run_strategy_2()

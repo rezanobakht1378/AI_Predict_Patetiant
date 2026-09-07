@@ -1,0 +1,6 @@
+Strategy 2 research summary
+Threshold: 0.67
+Best Height model: Linear_Regression (AIC); RMSE=0.0000
+Best Weight model: Linear_Regression (AIC); RMSE=0.1279
+Best BMI model: Linear_Regression (AIC); RMSE=0.0000
+All conclusions above are generated from strategy_2_best_models.csv.
