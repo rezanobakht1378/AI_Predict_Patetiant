@@ -14,6 +14,8 @@ from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.feature_selection import VarianceThreshold
+from sklearn.base import clone
+from imblearn.pipeline import Pipeline as ImbPipeline
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
@@ -79,7 +81,9 @@ for age, (weight_col, height_col) in age_mapping.items():
             ((df[height_col] / 100) ** 2)
         )
 
-        df.loc[(df[bmi_col] > 40) | (df[bmi_col] < 5), bmi_col] = np.nan
+        # Keep plausible pediatric BMI values; discard only non-finite or
+        # non-positive values rather than applying an adult-style hard cutoff.
+        df.loc[~np.isfinite(df[bmi_col]) | (df[bmi_col] <= 0), bmi_col] = np.nan
 
         bmi_raw_cols.append(bmi_col)
 
@@ -259,8 +263,8 @@ def compute_multiclass_specificity(conf_mat):
         fp = conf_mat[:, i].sum() - tp
         tn = conf_mat.sum() - (tp + fp + fn)
         denom = tn + fp
-        specificities.append(tn / denom if denom != 0 else 0.0)
-    return np.mean(specificities)
+        specificities.append(tn / denom if denom != 0 else np.nan)
+    return np.nanmean(specificities) if specificities else np.nan
 
 
 def remove_near_zero_variance_features(X, freq_cutoff=0.99):
@@ -296,6 +300,69 @@ def get_roc_auc_score(pipeline, X, y_true):
             return roc_auc_score(y_true, y_score[:, 1])
         return roc_auc_score(y_true, y_score)
     return roc_auc_score(y_true, y_score, average='macro', multi_class='ovr')
+
+
+def make_strategy_1_sampler(y_train):
+    """Create a train-only sampler with a valid SMOTE neighborhood."""
+    class_counts = y_train.value_counts()
+    if len(class_counts) < 2:
+        return RandomOverSampler(random_state=42)
+    min_class_count = int(class_counts.min())
+    if min_class_count <= 5:
+        return RandomOverSampler(random_state=42)
+    k_neighbors = max(1, min(5, min_class_count - 1))
+    return SMOTE(random_state=42, k_neighbors=k_neighbors)
+
+
+def save_strategy_1_roc_outputs(pipeline, X_test, y_test, current_age,
+                                target_key, model_name):
+    """Save ROC data for this exact model/transition evaluation."""
+    os.makedirs("roc_data", exist_ok=True)
+    os.makedirs("roc_plots", exist_ok=True)
+    if not hasattr(pipeline, "predict_proba"):
+        return
+    try:
+        y_probs = pipeline.predict_proba(X_test)
+    except Exception:
+        return
+
+    classes = np.asarray(pipeline.classes_)
+    y_binary = label_binarize(y_test, classes=classes)
+    if len(classes) == 2 and y_binary.shape[1] == 1:
+        y_binary = np.column_stack([1 - y_binary[:, 0], y_binary[:, 0]])
+
+    auc_rows = []
+    for class_index in range(y_binary.shape[1]):
+        if len(np.unique(y_binary[:, class_index])) < 2:
+            continue
+        fpr, tpr, thresholds = roc_curve(
+            y_binary[:, class_index], y_probs[:, class_index])
+        class_auc = roc_auc_score(
+            y_binary[:, class_index], y_probs[:, class_index])
+        class_label = classes[class_index]
+        stem = f"{current_age}_{target_key}_{model_name}_class_{class_label}"
+        pd.DataFrame({
+            "Threshold": thresholds,
+            "False Positive Rate": fpr,
+            "True Positive Rate": tpr,
+        }).to_csv(os.path.join("roc_data", f"{stem}.csv"), index=False)
+        plt.figure(figsize=(6, 6))
+        plt.plot(fpr, tpr, linewidth=2, label=f"AUC = {class_auc:.3f}")
+        plt.plot([0, 1], [0, 1], "--", color="gray")
+        plt.xlabel("False Positive Rate")
+        plt.ylabel("True Positive Rate")
+        plt.title(f"{model_name}\n{target_key}\nClass {class_label}")
+        plt.legend()
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join("roc_plots", f"{stem}.png"), dpi=300)
+        plt.close()
+        auc_rows.append({"Class": class_label, "AUC": class_auc})
+
+    pd.DataFrame(auc_rows).to_csv(
+        os.path.join("roc_data", f"{current_age}_{target_key}_{model_name}_AUC_summary.csv"),
+        index=False,
+    )
 
 # =====================================================================
 # 3. MULTI-CLASS CLASSIFICATION MODELS DICTIONARY
@@ -421,78 +488,37 @@ for transition in age_transitions:
             )
 
             original_train_label_counts = y_train.value_counts().to_dict()
-
-            imputer = SimpleImputer(strategy="median")
-
-            X_train = pd.DataFrame(
-                imputer.fit_transform(X_train),
-                columns=X_train.columns,
-                index=X_train.index
-            )
-
-            X_test = pd.DataFrame(
-                imputer.transform(X_test),
-                columns=X_test.columns,
-                index=X_test.index
-            )
-
-            # apply SMOTE / SMOTENC to the training set to handle class imbalance
-            X_train = X_train.copy()
-            X_test = X_test.copy()
-
-            if 'weight_birth_g' in X_train.columns:
-                X_train['weight_birth_g'] = pd.to_numeric(X_train['weight_birth_g'], errors='coerce')
-                X_test['weight_birth_g'] = pd.to_numeric(X_test['weight_birth_g'], errors='coerce')
-
-            numeric_cols = X_train.select_dtypes(include=[np.number]).columns.tolist()
-            cat_cols = [c for c in X_train.columns if c not in numeric_cols]
-
-            if numeric_cols:
-                num_imputer = SimpleImputer(strategy='median')
-                X_train[numeric_cols] = num_imputer.fit_transform(X_train[numeric_cols])
-                X_test[numeric_cols] = num_imputer.transform(X_test[numeric_cols])
-
-            if cat_cols:
-                cat_imputer = SimpleImputer(strategy='most_frequent')
-                X_train[cat_cols] = cat_imputer.fit_transform(X_train[cat_cols])
-                X_test[cat_cols] = cat_imputer.transform(X_test[cat_cols])
-
-            categorical_indices = [
-                idx for idx, col in enumerate(X_train.columns)
-                if col in ['birth_order', 'gender', 'delivery_type']
-            ]
-
-            minority_count = y_train.value_counts().min()
-            if minority_count <= 5:
-                oversampler = RandomOverSampler(random_state=42)
-            else:
-                if categorical_indices:
-                    oversampler = SMOTENC(categorical_features=categorical_indices, random_state=42)
-                else:
-                    oversampler = SMOTE(random_state=42)
-
-            try:
-                X_train, y_train = oversampler.fit_resample(X_train, y_train)
-            except Exception:
-                oversampler = RandomOverSampler(random_state=42)
-                X_train, y_train = oversampler.fit_resample(X_train, y_train)
-            
             os.makedirs("confusion_matrices", exist_ok=True)
             for model_name, model in models.items():
                 needs_scaling = model_name in ['Multinomial_Logistic', 'Support_Vector_Classifier', 'Neural_Network_MLP']
-                pipeline = Pipeline([
-                    ('preprocessor', get_processor(current_features, impute=False, scale=needs_scaling)),
-                    ('classifier', model)
-                ])
-                
-                pipeline.fit(X_train, y_train)
+                preprocessor = get_processor(
+                    current_features, impute=True, scale=needs_scaling)
+                sampler = make_strategy_1_sampler(y_train)
+                pipeline_steps = [
+                    ('preprocessor', preprocessor),
+                    ('sampler', sampler),
+                ]
+                pipeline_steps.append(('classifier', clone(model)))
+                pipeline = ImbPipeline(pipeline_steps)
+                try:
+                    pipeline.fit(X_train, y_train)
+                except (ValueError, np.linalg.LinAlgError):
+                    # SMOTE can be undefined for tiny classes; keep the
+                    # sampler inside the pipeline and fall back to ROS.
+                    pipeline_steps[1] = ('sampler', RandomOverSampler(random_state=42))
+                    pipeline = ImbPipeline(pipeline_steps)
+                    pipeline.fit(X_train, y_train)
                 predictions = pipeline.predict(X_test)
                 probs = None
-                if hasattr(pipeline.named_steps['classifier'], 'predict_proba'):
+                if hasattr(pipeline, 'predict_proba'):
                     try:
                         probs = pipeline.predict_proba(X_test)
                     except Exception:
                         probs = None
+
+                fitted_sampler = pipeline.named_steps['sampler']
+                sampled_labels = getattr(fitted_sampler, 'y_resampled_', y_train)
+                sampled_train_counts = sampled_labels.value_counts().to_dict()
 
                 class_codes = np.arange(len(label_names))
                 cm = confusion_matrix(y_test, predictions, labels=class_codes)
@@ -501,6 +527,9 @@ for transition in age_transitions:
                     f"confusion_matrices/confusion_{current_age}_{target_key}_{model_name}.csv",
                     index=False
                 )
+
+                save_strategy_1_roc_outputs(
+                    pipeline, X_test, y_test, current_age, target_key, model_name)
 
                 for class_code, label_name in enumerate(label_names):
                     label_test_count = int((y_test == class_code).sum())
@@ -515,7 +544,7 @@ for transition in age_transitions:
                         "Label": label_name,
                         "Total_Label_Count": int((y_valid == class_code).sum()),
                         "Train_Label_Count": int(original_train_label_counts.get(class_code, 0)),
-                        "Oversampled_Train_Label_Count": int((y_train == class_code).sum()),
+                        "Oversampled_Train_Label_Count": sampled_train_counts.get(class_code, 0),
                         "Test_Label_Count": label_test_count,
                         "Correct_Predictions": correct_predictions,
                         "Label_Accuracy": round(
@@ -541,11 +570,11 @@ for transition in age_transitions:
                     fp = mat[0,1]
 
                     if (tn + fp) == 0:
-                        specificities.append(0)
+                        specificities.append(np.nan)
                     else:
                         specificities.append(tn / (tn + fp))
 
-                specificity = np.mean(specificities)
+                specificity = np.nanmean(specificities) if specificities else np.nan
 
                 macro_auc = np.nan
                 weighted_auc = np.nan
@@ -627,96 +656,6 @@ pd.DataFrame(label_accuracy_results).to_csv(
     index=False
 )
 
-os.makedirs("roc_plots", exist_ok=True)
-os.makedirs("roc_data", exist_ok=True)
-
-# Binarize labels
-classes = np.unique(y_test)
-y_bin = label_binarize(y_test, classes=classes)
-
-auc_scores = []
-
-for i in range(y_bin.shape[1]):
-
-    # ROC
-    fpr, tpr, thresholds = roc_curve(
-        y_bin[:, i],
-        probs[:, i]
-    )
-
-    auc = roc_auc_score(
-        y_bin[:, i],
-        probs[:, i]
-    )
-
-    auc_scores.append({
-        "Class": classes[i],
-        "AUC": auc
-    })
-
-    # ============================
-    # Save ROC coordinates
-    # ============================
-
-    roc_df = pd.DataFrame({
-        "Threshold": thresholds,
-        "False Positive Rate": fpr,
-        "True Positive Rate": tpr
-    })
-
-    roc_df.to_csv(
-        f"roc_data/{current_age}_{target_key}_{model_name}_class_{classes[i]}.csv",
-        index=False
-    )
-
-    # ============================
-    # Plot ROC
-    # ============================
-
-    plt.figure(figsize=(6,6))
-
-    plt.plot(
-        fpr,
-        tpr,
-        linewidth=2,
-        label=f"AUC = {auc:.3f}"
-    )
-
-    plt.plot(
-        [0,1],
-        [0,1],
-        "--",
-        color="gray"
-    )
-
-    plt.xlabel("False Positive Rate")
-    plt.ylabel("True Positive Rate")
-
-    plt.title(
-        f"{model_name}\n{target_key}\nClass {classes[i]}"
-    )
-
-    plt.legend()
-
-    plt.grid(alpha=0.3)
-
-    plt.tight_layout()
-
-    plt.savefig(
-        f"roc_plots/{current_age}_{target_key}_{model_name}_class_{classes[i]}.png",
-        dpi=300
-    )
-
-    plt.close()
-
-# ==========================================
-# Save AUC summary for all classes
-# ==========================================
-
-pd.DataFrame(auc_scores).to_csv(
-    f"roc_data/{current_age}_{target_key}_{model_name}_AUC_summary.csv",
-    index=False
-)
 print("Time-series evaluation complete. Performance matrix generated sequentially.")
 
 # =====================================================================
@@ -743,8 +682,12 @@ def forward_stepwise_selection_mnlogit(X, y, criterion="aic"):
     current_features = ["const"]
     remaining_features = [c for c in X.columns if c != "const"]
 
-    base_model = sm.MNLogit(y, X[current_features]).fit(disp=0)
-    best_score = base_model.aic if criterion == "aic" else base_model.bic
+    try:
+        base_model = sm.MNLogit(y, X[current_features]).fit(
+            disp=0, method="lbfgs", maxiter=200)
+        best_score = base_model.aic if criterion == "aic" else base_model.bic
+    except (ValueError, np.linalg.LinAlgError, FloatingPointError):
+        return []
 
     while remaining_features:
         scores = []
@@ -753,7 +696,8 @@ def forward_stepwise_selection_mnlogit(X, y, criterion="aic"):
             test_features = current_features + [candidate]
 
             try:
-                model = sm.MNLogit(y, X[test_features]).fit(disp=0)
+                model = sm.MNLogit(y, X[test_features]).fit(
+                    disp=0, method="lbfgs", maxiter=200)
                 score = model.aic if criterion == "aic" else model.bic
                 scores.append((score, candidate))
             except Exception:
@@ -1037,12 +981,23 @@ for running_key, verified_data_pkg in optimized_spaces.items():
         for model_name, model_instance in models.items():
             try:
                 needs_scaling = model_name in ['Multinomial_Logistic', 'Support_Vector_Classifier', 'Neural_Network_MLP']
-                final_pipeline = Pipeline([
-                    ('preprocessor', get_processor(selected_features, impute=False, scale=needs_scaling)),
-                    ('classifier', model_instance)
-                ])
+                final_sampler = (
+                    make_strategy_1_sampler(y_train_final)
+                )
+                final_steps = [
+                    ('preprocessor', get_processor(
+                        selected_features, impute=True, scale=needs_scaling)),
+                    ('sampler', final_sampler),
+                ]
+                final_steps.append(('classifier', clone(model_instance)))
+                final_pipeline = ImbPipeline(final_steps)
 
-                final_pipeline.fit(X_train_final, y_train_final)
+                try:
+                    final_pipeline.fit(X_train_final, y_train_final)
+                except (ValueError, np.linalg.LinAlgError):
+                    final_steps[1] = ('sampler', RandomOverSampler(random_state=42))
+                    final_pipeline = ImbPipeline(final_steps)
+                    final_pipeline.fit(X_train_final, y_train_final)
                 predictions = final_pipeline.predict(X_test_final)
                 conf_mat = confusion_matrix(y_test_final, predictions)
                 acc = accuracy_score(y_test_final, predictions)
@@ -1054,7 +1009,7 @@ for running_key, verified_data_pkg in optimized_spaces.items():
                 mcc = matthews_corrcoef(y_test_final, predictions)
 
                 probs = None
-                if hasattr(final_pipeline.named_steps['classifier'], 'predict_proba'):
+                if hasattr(final_pipeline, 'predict_proba'):
                     try:
                         probs = final_pipeline.predict_proba(X_test_final)
                     except Exception:
@@ -1076,6 +1031,7 @@ for running_key, verified_data_pkg in optimized_spaces.items():
                     "Predictor_Age": predictor_age,
                     "Target_Age": target_age,
                     "Metric": metric_name,
+                    "Scenario": scenario_name,
                     "Feature_Space": space_name,
                     "Feature_Count": len(selected_features),
                     "Model": model_name,
@@ -1086,7 +1042,7 @@ for running_key, verified_data_pkg in optimized_spaces.items():
                     "Sensitivity": round(rec, 4),
                     "Specificity": round(specificity, 4),
                     "Balanced_Accuracy": round(balanced_acc, 4),
-                    "Matthews_Correlation": round(mcc, 4),
+                    "MCC": round(mcc, 4),
                     "ROC_AUC": round(auc, 4) if not np.isnan(auc) else None,
                     "Macro_ROC_AUC": round(macro_auc, 4) if not np.isnan(macro_auc) else None,
                     "Weighted_ROC_AUC": round(weighted_auc, 4) if not np.isnan(weighted_auc) else None,
@@ -1097,24 +1053,54 @@ for running_key, verified_data_pkg in optimized_spaces.items():
                 continue
 
 # =====================================================================
-# 9. FINAL SIDE-BY-SIDE PRESENTATION & EXPORT
+# 9. COMPREHENSIVE METHODS COMPARISON, PLOTS & EXPORT
 # =====================================================================
 if final_results_report:
     df_final_comparison = pd.DataFrame(final_results_report)
-    
-    # Save the complete micro-level tracking data out to disk
     df_final_comparison.to_csv('feature_reduction_performance.csv', index=False)
-    
-    # Pivot performance tracking macro metrics cleanly
-    performance_pivot = df_final_comparison.pivot_table(
-        index=["Transition_Key", "Model"], 
-        columns="Feature_Space", 
-        values=["Accuracy", "F1_Score", "Precision", "Recall", "Sensitivity", "Specificity", "ROC_AUC", "Macro_ROC_AUC", "Weighted_ROC_AUC"]
+
+    summary_metrics = [
+        "Accuracy", "F1_Score", "Precision", "Recall", "Specificity",
+        "Balanced_Accuracy", "MCC", "ROC_AUC"
+    ]
+    summary_metrics = [
+        metric for metric in summary_metrics
+        if metric in df_final_comparison.columns
+    ]
+    summary_table = (
+        df_final_comparison.groupby(["Model", "Feature_Space"], as_index=False)[summary_metrics]
+        .mean(numeric_only=True)
     )
-    
-    print("\n======================= FINAL FEATURE REDUCTION EVALUATION REPORT =======================")
-    print(performance_pivot.to_string())
-    print("\n[Data Export] CSV metric tables generated: 'feature_reduction_performance.csv'")
+    summary_table.to_csv('master_methods_comparison_summary.csv', index=False)
+
+    print("\n======================= MASTER METHODS COMPARISON SUMMARY =======================")
+    print(summary_table.to_string(index=False))
+
+    os.makedirs("comparison_plots", exist_ok=True)
+    plot_data = df_final_comparison.copy()
+    plt.figure(figsize=(12, 6))
+    sns.barplot(
+        data=plot_data, x="Model", y="F1_Score", hue="Feature_Space",
+        errorbar=None)
+    plt.xticks(rotation=25, ha="right")
+    plt.title("F1-Score by Classifier and Feature Space")
+    plt.ylabel("Mean F1-Score")
+    plt.tight_layout()
+    plt.savefig("comparison_plots/f1_score_comparison.png", dpi=300)
+    plt.close()
+
+    plt.figure(figsize=(12, 6))
+    sns.barplot(
+        data=plot_data, x="Model", y="ROC_AUC", hue="Feature_Space",
+        errorbar=None)
+    plt.xticks(rotation=25, ha="right")
+    plt.title("ROC-AUC by Classifier and Feature Space")
+    plt.ylabel("Mean ROC-AUC")
+    plt.tight_layout()
+    plt.savefig("comparison_plots/roc_auc_comparison.png", dpi=300)
+    plt.close()
+
+    print("\n[Data Export] Comparison tables and plots saved.")
 else:
     print("\n[Execution Warning] No classifiers could be trained. Check target distributions.")
 
@@ -1290,7 +1276,17 @@ def _strategy_2_regression_metrics(y_true, predictions):
     }
 
 
-def _strategy_2_channel_metrics(y_true, predictions):
+def _strategy_2_channel_probabilities(X_train, X_test, y_train):
+    """Estimate channel-change probabilities with a dedicated classifier."""
+    train_change = (np.abs(np.asarray(y_train)) >= Z_SCORE_CHANGE_THRESHOLD).astype(int)
+    if len(np.unique(train_change)) < 2:
+        return None
+    classifier = LogisticRegression(max_iter=1000, random_state=STRATEGY_2_RANDOM_STATE)
+    classifier.fit(X_train, train_change)
+    return classifier.predict_proba(X_test)[:, 1]
+
+
+def _strategy_2_channel_metrics(y_true, predictions, channel_probabilities=None):
     # هدف پیوسته به‌صورت جداگانه به تشخیص دودویی تغییر کانال تبدیل می‌شود.
     actual = (np.abs(y_true) >= Z_SCORE_CHANGE_THRESHOLD).astype(int)
     predicted = (np.abs(predictions) >= Z_SCORE_CHANGE_THRESHOLD).astype(int)
@@ -1306,8 +1302,11 @@ def _strategy_2_channel_metrics(y_true, predictions):
         "Balanced_Accuracy": balanced_accuracy_score(actual, predicted),
         "MCC": matthews_corrcoef(actual, predicted) if len(np.unique(predicted)) > 1 else 0.0,
         "Confusion_Matrix": np.array2string(matrix, separator=",")}
-    scores["ROC_AUC"] = (roc_auc_score(actual, np.abs(predictions))
-                          if len(np.unique(actual)) > 1 else np.nan)
+    scores["ROC_AUC"] = (
+        roc_auc_score(actual, channel_probabilities)
+        if channel_probabilities is not None and len(np.unique(actual)) > 1
+        else np.nan
+    )
     return scores
 
 
@@ -1352,13 +1351,16 @@ def run_strategy_2():
             X_train, X_test, y_train, y_test = train_test_split(
                 X, y, test_size=0.2, random_state=STRATEGY_2_RANDOM_STATE)
             preprocessor = _strategy_2_prepare_features(X_train, feature_columns)
+            encoded_feature_names = [
+                name.replace("numeric__", "").replace("categorical__", "")
+                for name in preprocessor.fit(X_train).get_feature_names_out()
+            ]
             X_train_encoded = pd.DataFrame(
-                preprocessor.fit_transform(X_train), index=X_train.index)
+                preprocessor.transform(X_train), index=X_train.index,
+                columns=encoded_feature_names)
             X_test_encoded = pd.DataFrame(
                 preprocessor.transform(X_test), index=X_test.index,
-                columns=X_train_encoded.columns)
-            X_train_encoded.columns = [f"feature_{i}" for i in range(X_train_encoded.shape[1])]
-            X_test_encoded.columns = X_train_encoded.columns
+                columns=encoded_feature_names)
 
             selected_by_method = {"Full": list(X_train_encoded.columns)}
             for criterion in ["AIC", "BIC"]:
@@ -1381,7 +1383,10 @@ def run_strategy_2():
                     pipeline.fit(X_train_encoded[selected], y_train)
                     predictions = pipeline.predict(X_test_encoded[selected])
                     regression = _strategy_2_regression_metrics(y_test, predictions)
-                    channel = _strategy_2_channel_metrics(y_test.to_numpy(), predictions)
+                    channel_probabilities = _strategy_2_channel_probabilities(
+                        X_train_encoded[selected], X_test_encoded[selected], y_train)
+                    channel = _strategy_2_channel_metrics(
+                        y_test.to_numpy(), predictions, channel_probabilities)
                     common = {
                         "Age": f"{current_age} -> {next_age}", "Current_Age": current_age,
                         "Next_Age": next_age, "Target": metric,
@@ -1392,11 +1397,20 @@ def run_strategy_2():
                     regression_rows.append({**common, **regression})
                     channel_rows.append({**common, **channel})
                     if selection_method != "Full":
-                        prediction_rows.extend({
-                            **common, "Actual_Delta_Z": actual, "Predicted_Delta_Z": predicted,
-                            "Actual_Channel_Change": int(abs(actual) >= Z_SCORE_CHANGE_THRESHOLD),
-                            "Predicted_Channel_Change": int(abs(predicted) >= Z_SCORE_CHANGE_THRESHOLD)
-                        } for actual, predicted in zip(y_test, predictions))
+                        prediction_rows.extend([
+                            {
+                                **common, 
+                                "Actual_Delta_Z": actual, 
+                                "Predicted_Delta_Z": predicted,
+                                "Actual_Channel_Change": int(abs(actual) >= Z_SCORE_CHANGE_THRESHOLD),
+                                "Predicted_Channel_Change": int(abs(predicted) >= Z_SCORE_CHANGE_THRESHOLD),
+                                "Predicted_Channel_Probability": (
+                                    float(channel_probabilities[index])
+                                    if channel_probabilities is not None and index < len(channel_probabilities) else np.nan
+                                )
+                            } 
+                            for index, (actual, predicted) in enumerate(zip(y_test, predictions))
+                        ])
 
     regression_df = pd.DataFrame(regression_rows)
     channel_df = pd.DataFrame(channel_rows)
