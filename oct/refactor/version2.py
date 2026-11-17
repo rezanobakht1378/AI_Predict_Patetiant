@@ -1,3 +1,8 @@
+# INVALIDATED PIPELINE. Do not quote this script's saved metrics as predictive performance.
+# Scenario 1 operational rule, confirmed by the authors: code 7 is the Healthy class.
+# Accepted BMI values are not recalculated here. Age-token feature matching in this file
+# can admit a later age (the token for 6 months occurs inside 36 months). Running this
+# file overwrites previous outputs. It was not rerun for the corrected manuscript.
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm

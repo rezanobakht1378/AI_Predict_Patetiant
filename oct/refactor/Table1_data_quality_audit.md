@@ -64,7 +64,7 @@ The proposal counts 380 and 359 were not used.
 - Age is the recorded `سن کودک(ماه)` value. It was not recalculated from dates. One non-numeric entry, `وو`, is missing.
 - Birth order uses integer values only. `1`, `2`, and `≥3` are the three table categories. Text such as `چهارقلو` or `2/دوقلو` is missing for this variable.
 - Birth BMI was not recalculated, and no Z-score was recalculated. The supplied birth Z columns were used after the validity screen.
-- Wasting in the profile is the study's BMI code, because that is what codes 1 and 2 represent. The file does not contain a weight-for-height Z-score.
+- Codes 1 and 2 are moderate and severe low BMI-for-age. The earlier label “wasting” was incorrect for this file, which has no weight-for-height Z-score.
 - Concurrent forms count distinct indicator pairs, not raw codes. One pair can contribute only one form.
 - Positive binary percentages use children with code 1 or 2 as the denominator. Code 3 is not counted as no.
 
@@ -177,8 +177,8 @@ Binary known-code tables are [yes healthy, yes malnourished; no healthy, no maln
 
 | Row | n | Cell |
 | --- | --- | --- |
-| Wasting moderate (code 2) | 93 | 93 (44.1) |
-| Wasting severe (code 1) | 16 | 16 (7.6) |
+| Moderate low BMI-for-age (code 2) | 93 | 93/211 (44.1) |
+| Severe low BMI-for-age (code 1) | 16 | 16/211 (7.6) |
 | Underweight moderate (code 4) | 114 | 114 (54.0) |
 | Underweight severe (code 3) | 15 | 15 (7.1) |
 | Stunting moderate (code 6) | 82 | 82 (38.9) |

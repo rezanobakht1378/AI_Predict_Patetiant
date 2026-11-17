@@ -485,7 +485,7 @@ def populate_workbook(results: dict):
         "1 = severe low BMI, 2 = moderate low BMI, 3 = severe low weight-for-age, "
         "4 = moderate low weight-for-age, 5 = severe low length-for-age, "
         "6 = moderate low length-for-age. "
-        "Wasting here is the dataset's BMI classification, not a separately calculated weight-for-height Z-score. "
+        "Codes 1 and 2 are low BMI-for-age, not a weight-for-height classification. "
         "A form is one indicator pair. Severity levels within a pair do not co-occur."
     )
     for row, key in profile_rows.items():
@@ -518,7 +518,7 @@ def populate_workbook(results: dict):
             "Malnutrition codes",
             "The file's BMI_Category, wt_Category and ht_Category columns use codes 1–2, 3–4 and 5–6 "
             "with no exceptions at the Z cut-points ≤ −3, −3 to −2, and > −2. "
-            "Those pairs never co-occur. Wasting in this table follows the BMI codes. "
+            "Those pairs never co-occur. Codes 1 and 2 are low BMI-for-age. They are not a weight-for-height classification. "
             "It is not a weight-for-height Z-score.",
         ),
         24: (
@@ -631,7 +631,7 @@ def write_report(frame: pd.DataFrame, exclusions: dict, results: dict):
         "- Age is the recorded `سن کودک(ماه)` value. It was not recalculated from dates. One non-numeric entry, `وو`, is missing.",
         "- Birth order uses integer values only. `1`, `2`, and `≥3` are the three table categories. Text such as `چهارقلو` or `2/دوقلو` is missing for this variable.",
         "- Birth BMI was not recalculated, and no Z-score was recalculated. The supplied birth Z columns were used after the validity screen.",
-        "- Wasting in the profile is the study's BMI code, because that is what codes 1 and 2 represent. The file does not contain a weight-for-height Z-score.",
+        "- Codes 1 and 2 are low BMI-for-age. The file does not contain a weight-for-height Z-score, so those codes are not called wasting.",
         "- Concurrent forms count distinct indicator pairs, not raw codes. One pair can contribute only one form.",
         "- Positive binary percentages use children with code 1 or 2 as the denominator. Code 3 is not counted as no.",
         "",
@@ -736,8 +736,8 @@ def write_report(frame: pd.DataFrame, exclusions: dict, results: dict):
         markdown_table(
             [
                 ["Row", "n", "Cell"],
-                ["Wasting moderate (code 2)", results["profile"]["wasting_moderate_n"], results["profile"]["wasting_moderate"]],
-                ["Wasting severe (code 1)", results["profile"]["wasting_severe_n"], results["profile"]["wasting_severe"]],
+                ["Moderate low BMI-for-age (code 2)", results["profile"]["wasting_moderate_n"], results["profile"]["wasting_moderate"]],
+                ["Severe low BMI-for-age (code 1)", results["profile"]["wasting_severe_n"], results["profile"]["wasting_severe"]],
                 ["Underweight moderate (code 4)", results["profile"]["underweight_moderate_n"], results["profile"]["underweight_moderate"]],
                 ["Underweight severe (code 3)", results["profile"]["underweight_severe_n"], results["profile"]["underweight_severe"]],
                 ["Stunting moderate (code 6)", results["profile"]["stunting_moderate_n"], results["profile"]["stunting_moderate"]],
